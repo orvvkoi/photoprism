@@ -42,7 +42,7 @@ func searchPhotosForm(c *gin.Context) (frm form.SearchPhotos, s *entity.Session,
 	// Ignore private flag if feature is disabled.
 	if frm.Scope == "" &&
 		settings.Features.Review &&
-		acl.Rules.Deny(acl.ResourcePhotos, s.GetUserRole(), acl.ActionManage) {
+		s.Denies(acl.ResourcePhotos, acl.ActionManage) {
 		frm.Quality = 3
 	}
 

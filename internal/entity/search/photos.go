@@ -73,6 +73,18 @@ func searchPhotos(frm form.SearchPhotos, sess *entity.Session, resultCols string
 	if txt.NotEmpty(frm.Near) {
 		photo := Photo{}
 
+		// Require the reference to be visible to the session before its position is used. A reference
+		// the session may not see takes the same path as a missing one. This block must stay above
+		// the scope block: PhotoVisibleToSession re-enters UserPhotos through the shared smart album
+		// fallback, and the inner form carries no reference only because it is built before one is
+		// deserialized from a stored filter.
+		if visible, vErr := PhotoVisibleToSession(frm.Near, sess); vErr != nil {
+			log.Debugf("search: %s (check nearby)", vErr)
+			return PhotoResults{}, 0, ErrNotFound
+		} else if !visible {
+			return PhotoResults{}, 0, ErrNotFound
+		}
+
 		// Find a nearby picture using the UID or return an empty result otherwise.
 		if err = Db().First(&photo, "photo_uid = ?", frm.Near).Error; err != nil {
 			log.Debugf("search: %s (find nearby)", err)
@@ -155,36 +167,34 @@ func searchPhotos(frm form.SearchPhotos, sess *entity.Session, resultCols string
 		frm.Review = false
 	}
 
-	// Check session permissions and apply as needed.
+	// Check session permissions and apply as needed. Each check evaluates the session's effective
+	// role: for a client session, the intersection of the client and user roles.
 	if sess != nil {
 		user := sess.GetUser()
-		aclRole := user.AclRole()
 
 		// Exclude private content.
-		if acl.Rules.Deny(acl.ResourcePhotos, aclRole, acl.AccessPrivate) {
+		if sess.Denies(acl.ResourcePhotos, acl.AccessPrivate) {
 			frm.Public = true
 			frm.Private = false
 		}
 
 		// Exclude archived content.
-		if acl.Rules.Deny(acl.ResourcePhotos, aclRole, acl.ActionDelete) {
+		if sess.Denies(acl.ResourcePhotos, acl.ActionDelete) {
 			frm.Archived = false
 			frm.Review = false
 		}
 
 		// Exclude hidden files.
-		if acl.Rules.Deny(acl.ResourceFiles, aclRole, acl.AccessAll) {
+		if sess.Denies(acl.ResourceFiles, acl.AccessAll) {
 			frm.Hidden = false
 		}
 
 		// Visitors and other restricted users can only access shared content. A non-empty Scope
-		// bypasses the personal ScopePhotosForSession filter below, so it is gated here instead:
-		// a restricted session may scope only to an album it owns or has shared. "Restricted" means
-		// shared-only or unregistered; this assumes any view-capable role lacking library/all access
-		// also holds access_shared (else HasSharedAccessOnly would not flag it).
-		if frm.Scope != "" && album.CreatedBy != user.UserUID && !sess.HasShare(frm.Scope) && (sess.GetUser().HasSharedAccessOnly(acl.ResourcePhotos) || sess.NotRegistered()) ||
-			frm.Scope == "" && acl.Rules.Deny(acl.ResourcePhotos, aclRole, acl.ActionSearch) {
-			event.AuditErr([]string{sess.IP(), "session %s", "%s %s as %s", status.Denied}, sess.RefID, acl.ActionSearch.String(), string(acl.ResourcePhotos), aclRole)
+		// bypasses the personal ScopePhotosForSession filter below, so it is gated here instead: a
+		// session without whole-library reach may scope only to an album it owns or has shared.
+		if frm.Scope != "" && album.CreatedBy != user.UserUID && !sess.HasShare(frm.Scope) && (sess.DeniesAll(acl.ResourcePhotos, libraryAccess) || sess.NotRegistered()) ||
+			frm.Scope == "" && sess.Denies(acl.ResourcePhotos, acl.ActionSearch) {
+			event.AuditErr([]string{sess.IP(), "session %s", "%s %s as %s", status.Denied}, sess.RefID, acl.ActionSearch.String(), string(acl.ResourcePhotos), sessionAuditRole(sess))
 			return PhotoResults{}, 0, ErrForbidden
 		}
 
