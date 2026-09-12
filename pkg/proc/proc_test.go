@@ -189,3 +189,76 @@ func TestRun_TerminateBeforeKill(t *testing.T) {
 	assert.True(t, errors.Is(Run(cmd, 300*time.Millisecond), ErrTimeout))
 	assert.FileExists(t, marker, "the command must be asked to terminate before it is killed")
 }
+
+func TestRun_TermResistantDescendant(t *testing.T) {
+	// The deadline covers the whole tree, so a descendant that does not act on the termination
+	// request must be gone by the time Run returns, even though the command itself exited on it.
+	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+
+	// The descendant releases the output pipes so the command can be reaped while it is still
+	// running, and gives itself a finite lifetime so a failing run cannot leave it behind.
+	script := `sh -c 'trap "" TERM; i=0; while [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done' >/dev/null 2>&1 &
+echo $! > ` + pidFile + `
+trap 'exit 0' TERM
+while true; do sleep 0.05; done`
+
+	// #nosec G204 -- the script is a constant with a test-owned temporary path.
+	cmd := exec.Command("/bin/sh", "-c", script)
+	cmd.Stderr = &bytes.Buffer{}
+
+	pid := 0
+
+	t.Cleanup(func() {
+		if pid > 0 {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+
+	start := time.Now()
+	assert.True(t, errors.Is(Run(cmd, 300*time.Millisecond), ErrTimeout))
+	elapsed := time.Since(start)
+
+	raw, err := os.ReadFile(pidFile) //nolint:gosec // test fixture reads a test-owned temporary path
+	require.NoError(t, err)
+
+	pid, err = strconv.Atoi(strings.TrimSpace(string(raw)))
+	require.NoError(t, err)
+
+	assert.False(t, processAlive(t, pid), "a descendant that ignores the termination request must not outlive the call")
+	assert.Less(t, elapsed, KillGrace, "the command exits on the request, so the call must not wait out the grace period")
+}
+
+// processAlive reports whether a process with the given id is still running. A killed process may
+// linger briefly as a zombie until its new parent reaps it, which signal 0 cannot distinguish, so
+// the process state is read instead.
+func processAlive(t *testing.T, pid int) bool {
+	t.Helper()
+
+	if _, err := os.ReadFile("/proc/self/stat"); err != nil { //nolint:gosec // fixed diagnostic path
+		t.Skip("process state is not readable on this system")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+
+	for {
+		status, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat") //nolint:gosec // pid is produced by the test
+
+		if err != nil {
+			return false
+		}
+
+		// The state follows the executable name, which is parenthesized and may itself contain
+		// spaces, so the fields are read from the last closing parenthesis.
+		if i := strings.LastIndex(string(status), ")"); i >= 0 {
+			if fields := strings.Fields(string(status)[i+1:]); len(fields) > 0 && fields[0] == "Z" {
+				return false
+			}
+		}
+
+		if time.Now().After(deadline) {
+			return true
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+}

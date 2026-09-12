@@ -1,6 +1,6 @@
 /*
-Package proc runs external commands with a deadline and terminates the whole process tree they
-create, so that a tool which delegates work to a helper cannot outlive the call that started it.
+Package proc runs external commands with a deadline and terminates the process group they create,
+so that a tool which delegates work to a helper cannot outlive the call that started it.
 */
 package proc
 
@@ -17,9 +17,9 @@ var ErrTimeout = errors.New("command timed out")
 // killed outright, and how long the command is then given to release the pipes it writes to.
 var KillGrace = 5 * time.Second
 
-// Run starts the given command and waits for it to finish, terminating it and everything it
-// spawned when the timeout expires. A timeout below or equal to zero runs the command without
-// a deadline. The command must not have been started yet.
+// Run starts the given command and waits for it to finish, terminating it and everything that
+// stays in its process group when the timeout expires. A timeout below or equal to zero runs the
+// command without a deadline. The command must not have been started yet.
 func Run(cmd *exec.Cmd, timeout time.Duration) error {
 	if cmd == nil {
 		return errors.New("command is nil")
@@ -46,8 +46,9 @@ func Run(cmd *exec.Cmd, timeout time.Duration) error {
 		return err
 	}
 
-	// Resolved once, while the process is certainly alive. After Wait reaps it the id may be
-	// reused, and signaling a group that is no longer this command's is worse than not signaling.
+	// Resolved once, while the process is certainly alive: after Wait reaps it, Getpgid can no
+	// longer tell whether the id is still this command's. The number itself stays pinned for as
+	// long as the group has members, which is what makes the escalation below safe.
 	group := processGroup(cmd)
 
 	done := make(chan error, 1)
@@ -78,15 +79,22 @@ func Run(cmd *exec.Cmd, timeout time.Duration) error {
 	grace := time.NewTimer(KillGrace)
 	defer grace.Stop()
 
+	reaped := false
+
 	select {
 	case <-done:
-		return ErrTimeout
+		reaped = true
 	case <-grace.C:
 	}
 
+	// The group is killed even once the command itself has been reaped, because a descendant that
+	// did not accept the termination request is still in it. Reaping the leader does not release
+	// the group id while the group has members, so the signal reaches this tree or nothing at all.
 	killProcessGroup(group)
 
-	<-done
+	if !reaped {
+		<-done
+	}
 
 	return ErrTimeout
 }
