@@ -9,7 +9,7 @@ The following 3rd-party software packages may be used by or distributed with
 PhotoPrism. Any information relevant to third-party vendors listed below are
 collected using common, reasonable means.
 
-Date generated: 2026-09-11
+Date generated: 2026-09-12
 
 ================================================================================
 
@@ -9022,7 +9022,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 --------------------------------------------------------------------------------
 
-Package: golang.org/x/sync/errgroup
+Package: golang.org/x/sync
 Version: v0.23.0
 License: BSD-3-Clause (https://cs.opensource.google/go/x/sync/+/v0.23.0:LICENSE)
 

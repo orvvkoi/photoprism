@@ -542,6 +542,9 @@ func persistRegistration(c *config.Config, r *cluster.RegisterResponse, wantRota
 
 // primeJWKS eagerly fetches the Portal JWKS so that subsequent token
 // verification does not incur network latency during critical operations.
+// It uses its own verifier and reaches the request-serving one only through
+// the shared cache file, so it does not spend that verifier's forced refresh
+// interval.
 func primeJWKS(c *config.Config, url string) {
 	if c == nil {
 		return

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	gojwt "github.com/golang-jwt/jwt/v5"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/photoprism/photoprism/internal/config"
 	"github.com/photoprism/photoprism/pkg/fs"
@@ -53,9 +54,13 @@ const (
 	jwksFetchBaseDelay = 200 * time.Millisecond
 	// jwksFetchMaxDelay is the upper bound for retry delays to prevent unbounded backoff.
 	jwksFetchMaxDelay = 2 * time.Second
-	// jwksFetchRetryAfter is how long a failed refresh is answered from memory, so an
-	// unreachable endpoint costs one attempt per interval rather than one per request.
+	// jwksFetchRetryAfter is how long a failed refresh is answered from memory.
 	jwksFetchRetryAfter = 30 * time.Second
+	// jwksForceRefreshAfter is the minimum interval between two forced refreshes of the same
+	// endpoint, so a rotated key is discovered promptly while refresh work stays bounded per endpoint.
+	jwksForceRefreshAfter = 30 * time.Second
+	// defaultJWKSCacheTTL applies when no cache TTL is configured.
+	defaultJWKSCacheTTL = 300 * time.Second
 )
 
 // randInt63n is defined for deterministic testing of jitter (overridable in tests).
@@ -80,6 +85,12 @@ type Verifier struct {
 	failedURL string
 	failedAt  int64
 	failedErr error
+
+	// forcedAt records the last forced refresh per configured JWKS endpoint.
+	forcedAt map[string]int64
+
+	// fetches coalesces concurrent refreshes of the same endpoint into one request.
+	fetches singleflight.Group
 
 	httpClient *http.Client
 	now        func() time.Time
@@ -392,14 +403,110 @@ func (v *Verifier) publicKeyForKid(ctx context.Context, url, kid string, force b
 	return nil, errKeyNotFound
 }
 
-// keysForURL returns JWKS keys for the specified endpoint, reusing cache when possible.
+// keysForURL returns JWKS keys for the specified endpoint, reusing cache when possible. Concurrent
+// callers for the same endpoint share one refresh.
 func (v *Verifier) keysForURL(ctx context.Context, url string, force bool) ([]PublicJWK, error) {
-	ttl := 300 * time.Second
+	ttl := defaultJWKSCacheTTL
 
 	if v.conf != nil && v.conf.JWKSCacheTTL() > 0 {
 		ttl = time.Duration(v.conf.JWKSCacheTTL()) * time.Second
 	}
 
+	// A forced refresh runs at most once per interval per endpoint; beyond that the request is
+	// answered from cache.
+	if force && !v.forcedRefreshDue(url) {
+		force = false
+	}
+
+	cached := v.snapshotCache()
+
+	if keys, ok := v.cachedKeys(url, ttl, cached, force); ok {
+		return keys, nil
+	}
+
+	if !force {
+		if failure := v.recentFetchFailure(url); failure != nil {
+			return v.keysAfterFailedRefresh(url, ttl, force, cached, failure)
+		}
+	}
+
+	// Callers share the fetch, not the outcome: it is detached from any one request context, so a
+	// caller that goes away neither cancels it nor decides what the others are served.
+	ch := v.fetches.DoChan(url, func() (any, error) {
+		return v.refreshKeys(context.WithoutCancel(ctx), url, ttl, force && v.takeForcedRefresh(url))
+	})
+
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return v.keysAfterFailedRefresh(url, ttl, force, v.snapshotCache(), res.Err)
+		}
+
+		keys, _ := res.Val.([]PublicJWK)
+
+		return append([]PublicJWK(nil), keys...), nil
+	case <-ctx.Done():
+		return v.keysAfterFailedRefresh(url, ttl, force, v.snapshotCache(), ctx.Err())
+	}
+}
+
+// keysAfterFailedRefresh applies this caller's own fallback when a refresh did not deliver keys, so a
+// shared refresh cannot strip an ordinary verification of the cached keys it may still be served. A
+// forced caller wants the error, since it is asking whether the endpoint has something new.
+func (v *Verifier) keysAfterFailedRefresh(url string, ttl time.Duration, force bool, cached cacheEntry, err error) ([]PublicJWK, error) {
+	if !force {
+		if keys, ok := v.staleKeys(url, ttl, cached); ok {
+			return keys, nil
+		}
+	}
+
+	return nil, err
+}
+
+// forcedRefreshDue reports whether a forced refresh of the endpoint is due, without recording one.
+func (v *Verifier) forcedRefreshDue(url string) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	return v.forcedRefreshDueLocked(url)
+}
+
+// takeForcedRefresh records a forced refresh and reports whether it was due. Only the goroutine that
+// performs the fetch calls it, so a caller joining a refresh in flight does not consume the interval.
+func (v *Verifier) takeForcedRefresh(url string) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if !v.forcedRefreshDueLocked(url) {
+		return false
+	}
+
+	if v.forcedAt == nil {
+		v.forcedAt = make(map[string]int64)
+	}
+
+	v.forcedAt[url] = v.now().Unix()
+
+	return true
+}
+
+// forcedRefreshDueLocked reports whether the endpoint's forced refresh interval has elapsed; the
+// caller must hold the mutex.
+func (v *Verifier) forcedRefreshDueLocked(url string) bool {
+	last, ok := v.forcedAt[url]
+
+	if !ok {
+		return true
+	}
+
+	age := v.now().Unix() - last
+
+	return age < 0 || time.Duration(age)*time.Second >= jwksForceRefreshAfter
+}
+
+// refreshKeys fetches and caches the JWKS for the endpoint, retrying a transient error within the
+// request that hit it. It runs inside the single-flight group, so only one call per endpoint is active.
+func (v *Verifier) refreshKeys(ctx context.Context, url string, ttl time.Duration, force bool) ([]PublicJWK, error) {
 	attempts := 0
 
 	for {
@@ -410,7 +517,9 @@ func (v *Verifier) keysForURL(ctx context.Context, url string, force bool) ([]Pu
 		}
 
 		// Only on entry: once a failure has been recorded, the retry attempts below must
-		// still run so a transient blip is ridden out within the request that hit it.
+		// still run so a transient blip is ridden out within the request that hit it. An explicit
+		// refresh still tries, so priming is never blocked; allowForcedRefresh is what bounds how
+		// often it may.
 		if attempts == 0 && !force {
 			if failure := v.recentFetchFailure(url); failure != nil {
 				if keys, ok := v.staleKeys(url, ttl, cached); ok {
