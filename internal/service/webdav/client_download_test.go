@@ -5,12 +5,16 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/photoprism/photoprism/pkg/clean"
 	"github.com/photoprism/photoprism/pkg/fs"
 )
 
@@ -279,4 +283,45 @@ func TestClient_DownloadKeepsDestinationMode(t *testing.T) {
 	info, err := os.Stat(dest)
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "replacing a file must not widen its mode")
+}
+
+// captureLog redirects the package logger for the duration of the test and returns its entries.
+func captureLog(t *testing.T) *test.Hook {
+	t.Helper()
+
+	orig := log
+	logger, hook := test.NewNullLogger()
+	logger.SetLevel(logrus.TraceLevel)
+	log = logger
+
+	t.Cleanup(func() { log = orig })
+
+	return hook
+}
+
+func TestNewClientLogsEndpointWithoutCredentials(t *testing.T) {
+	// Deliberately made of characters the sanitizers pass through unchanged, so the absence of the
+	// password below means it was redacted rather than merely escaped out of recognition.
+	const password = "sup3rs3cr3t-w3bdav-p4ss"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	hook := captureLog(t)
+
+	_, err := NewClient(server.URL+"/", "webdav-user", password, TimeoutLow, "")
+	require.NoError(t, err)
+
+	var logged strings.Builder
+
+	for _, entry := range hook.AllEntries() {
+		logged.WriteString(entry.Message)
+		logged.WriteString("\n")
+	}
+
+	assert.NotContains(t, logged.String(), password, "the configured password must not reach the log")
+	assert.Contains(t, logged.String(), clean.UriRedactedValue, "the credential is marked as removed")
+	assert.Contains(t, logged.String(), "webdav-user", "the account name identifies the connection")
 }

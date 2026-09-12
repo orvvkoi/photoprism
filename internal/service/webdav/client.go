@@ -114,7 +114,9 @@ func NewClient(serverUrl, user, pass string, timeout Timeout, servicesCIDR strin
 
 	serverUrl = endpoint.String()
 
-	log.Debugf("webdav: connecting to %s", clean.Log(serverUrl))
+	// The endpoint carries the configured account credentials, which the transport needs and a log
+	// line does not.
+	log.Debugf("webdav: connecting to %s", clean.Log(clean.UriRedacted(serverUrl)))
 
 	client, err := webdav.NewClient(newTransferHTTPClient(allowedCIDRs), serverUrl)
 
