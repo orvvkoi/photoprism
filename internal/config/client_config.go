@@ -759,8 +759,11 @@ func (c *Config) ClientSession(sess *entity.Session) (cfg *ClientConfig) {
 		cfg.PreviewToken = sess.PreviewToken
 
 		// The download token is the "?t=" value: a signed, session-bound token so header-less download
-		// endpoints can scope the response to this session.
-		cfg.DownloadToken = tokens.DownloadToken(sess.ID)
+		// endpoints can scope the response to this session. It is delivered only when the session's scope
+		// covers a downloadable resource; the endpoints apply their own scope check.
+		if sess.ScopePermitsDownload() {
+			cfg.DownloadToken = tokens.DownloadToken(sess.ID)
+		}
 	default:
 		// A session without its own preview token receives neither token: the instance-wide values stay
 		// registered and accepted, so existing URLs keep working, but they are not handed to a caller

@@ -56,7 +56,9 @@ func DownloadAlbum(router *gin.RouterGroup) {
 			return
 		}
 
-		sess, valid := AuthDownload(c)
+		// The archive streams pictures, so it needs the same download authority as the ZIP endpoints; the
+		// album itself is gated by albumViewableBySession below.
+		sess, valid := AuthDownload(c, acl.Resources{acl.ResourcePhotos})
 		if !valid {
 			AbortForbidden(c)
 			return

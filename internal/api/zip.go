@@ -214,7 +214,7 @@ func ZipCreate(router *gin.RouterGroup) {
 //	@Router		/api/v1/zip/{filename} [get]
 func ZipDownload(router *gin.RouterGroup) {
 	router.GET("/zip/:filename", func(c *gin.Context) {
-		sess, valid := AuthDownload(c)
+		sess, valid := AuthDownload(c, acl.Resources{acl.ResourcePhotos})
 
 		if !valid {
 			AbortForbidden(c)

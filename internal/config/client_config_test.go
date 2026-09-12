@@ -524,6 +524,15 @@ func TestConfig_ClientSessionConfig(t *testing.T) {
 		assert.True(t, f.Review)
 		assert.False(t, f.Share)
 	})
+	t.Run("ScopeWithoutDownload", func(t *testing.T) {
+		// A scope that covers no downloadable resource still receives its preview token, but no
+		// download token.
+		sess := entity.SessionFixtures.Pointer("alice_app_password_shares")
+		cfg := c.ClientSession(sess)
+
+		assert.Equal(t, sess.PreviewToken, cfg.PreviewToken)
+		assert.Empty(t, cfg.DownloadToken)
+	})
 	t.Run("RoleVisitor", func(t *testing.T) {
 		sess := entity.SessionFixtures.Pointer("visitor")
 		want := sess.PreviewToken
@@ -569,7 +578,8 @@ func TestConfig_ClientSessionConfig(t *testing.T) {
 		assert.IsType(t, &ClientConfig{}, cfg)
 		assert.Equal(t, false, cfg.Public)
 		assert.Equal(t, want, cfg.PreviewToken)
-		assert.NotEmpty(t, cfg.DownloadToken)
+		// The metrics scope covers no downloadable resource.
+		assert.Empty(t, cfg.DownloadToken)
 
 		f := cfg.Settings.Features
 		assert.NotEqual(t, adminFeatures, f)

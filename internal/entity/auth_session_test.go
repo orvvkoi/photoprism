@@ -1285,6 +1285,36 @@ func TestSession_NoScopeAndHasScope(t *testing.T) {
 	assert.True(t, sess.HasScope())
 }
 
+func TestSession_ScopePermitsDownload(t *testing.T) {
+	t.Run("NoScope", func(t *testing.T) {
+		assert.True(t, (&Session{}).ScopePermitsDownload())
+		assert.True(t, (&Session{AuthScope: list.Any}).ScopePermitsDownload())
+	})
+	t.Run("Photos", func(t *testing.T) {
+		assert.True(t, (&Session{AuthScope: "photos albums"}).ScopePermitsDownload())
+	})
+	t.Run("Files", func(t *testing.T) {
+		assert.True(t, (&Session{AuthScope: "files"}).ScopePermitsDownload())
+	})
+	t.Run("Read", func(t *testing.T) {
+		assert.True(t, (&Session{AuthScope: "read"}).ScopePermitsDownload())
+	})
+	t.Run("Unrelated", func(t *testing.T) {
+		assert.False(t, (&Session{AuthScope: "albums shares"}).ScopePermitsDownload())
+		assert.False(t, (&Session{AuthScope: "config"}).ScopePermitsDownload())
+		assert.False(t, (&Session{AuthScope: "metrics"}).ScopePermitsDownload())
+	})
+	t.Run("WriteOnly", func(t *testing.T) {
+		assert.False(t, (&Session{AuthScope: "photos write"}).ScopePermitsDownload())
+		assert.False(t, (&Session{AuthScope: "files write"}).ScopePermitsDownload())
+	})
+	t.Run("ValueTerm", func(t *testing.T) {
+		// A scope term carrying a value does not match its own resource, so it permits nothing here.
+		assert.False(t, (&Session{AuthScope: "photos:read"}).ScopePermitsDownload())
+		assert.False(t, (&Session{AuthScope: "files:read"}).ScopePermitsDownload())
+	})
+}
+
 func TestSession_SetUserScopeDefault(t *testing.T) {
 	t.Run("DefaultsToUserScope", func(t *testing.T) {
 		sess := &Session{}

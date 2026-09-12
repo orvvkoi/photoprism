@@ -641,6 +641,19 @@ func (m *Session) InsufficientScope(resource acl.Resource, perms acl.Permissions
 	return !m.ValidateScope(resource, perms)
 }
 
+// ScopePermitsDownload checks if the scope includes download access to pictures or their files, the two
+// resources the download endpoints authorize against. Token delivery consults it; the endpoints apply
+// their own per-resource scope check.
+func (m *Session) ScopePermitsDownload() bool {
+	if m.NoScope() {
+		return true
+	}
+
+	perms := acl.Permissions{acl.ActionDownload}
+
+	return m.ValidateScope(acl.ResourcePhotos, perms) || m.ValidateScope(acl.ResourceFiles, perms)
+}
+
 // SetScope sets a custom authentication scope.
 func (m *Session) SetScope(scope string) *Session {
 	if scope == "" {
