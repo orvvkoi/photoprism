@@ -12,7 +12,8 @@
 ## File I/O — Overwrite Policy (force semantics)
 
 - Default is safety-first: callers must not overwrite non-empty destination files unless they opt-in with `force=true`. Replacing empty destinations is allowed without `force`.
-- Enforce the policy in the `open` itself, not only in a preceding check: create with `O_CREATE|O_EXCL` where a call must not replace an existing file, write through a uniquely named temporary sibling and rename it into place where it must, and remove only the file the call itself created. Reserve `O_TRUNC` for a call that deliberately overwrites in place, where it also avoids trailing bytes.
+- Enforce the policy in the filesystem call itself, not only in a preceding check: write through a uniquely named temporary sibling created with `O_CREATE|O_EXCL`, and publish it with `os.Rename` where the call may replace the destination or with `os.Link` where it may not, since the link fails when the name is taken. Reserve `O_TRUNC` for a call that deliberately overwrites in place, where it also avoids trailing bytes.
+- Remove only the file the call itself created. A staged write keeps the destination out of its own error handling, so no cleanup path unlinks a name the call did not create.
 - Where this lives: `internal/photoprism/mediafile.go` (`MediaFile.Copy/Move`), `pkg/fs/copy_move.go` (`fs.Copy` / `fs.Move`), `internal/service/webdav/client.go` (`Client.Download`).
 - When to set `force=true`: explicit "replace" actions or admin tools where the user confirmed overwrite. Not for import/index flows — Originals must not be clobbered.
 

@@ -1,14 +1,17 @@
 package webdav
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
+	dav "github.com/emersion/go-webdav"
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
@@ -49,27 +52,29 @@ func TestClient_DownloadCreatesExclusively(t *testing.T) {
 	t.Run("DestinationAppearingDuringTheRequestIsKept", func(t *testing.T) {
 		dest := filepath.Join(t.TempDir(), "local.bin")
 
-		// A file created while the request is in flight must be kept: the destination is created
-		// exclusively, so this call never replaces it.
+		// A file created while the request is in flight must be kept: the destination is claimed
+		// only at the end, and only when the name is still free.
 		client := downloadTestClient(t, "remote", func() {
 			require.NoError(t, os.WriteFile(dest, []byte("local"), fs.ModeFile))
 		})
 
 		err := client.Download("/local.bin", dest, false)
-		require.Error(t, err)
+		// The sync worker reads the collision from the error type, and counts it against neither its
+		// retry budget nor its error log.
+		assert.ErrorIs(t, err, os.ErrExist)
 
 		got, readErr := os.ReadFile(dest) //nolint:gosec // test fixture reads a test-owned temporary path
 		require.NoError(t, readErr)
 		assert.Equal(t, "local", string(got), "the local file must not be replaced")
 	})
 	t.Run("ExistingDestinationIsRefused", func(t *testing.T) {
-		// Guards the early existence check rather than the exclusive create; the subtest above is
-		// what discriminates the open.
+		// Guards the early existence check rather than the publish; the subtest above is what
+		// discriminates it.
 		dest := filepath.Join(t.TempDir(), "local.bin")
 		require.NoError(t, os.WriteFile(dest, []byte("local"), fs.ModeFile))
 
 		client := downloadTestClient(t, "remote", nil)
-		require.Error(t, client.Download("/local.bin", dest, false))
+		assert.ErrorIs(t, client.Download("/local.bin", dest, false), os.ErrExist)
 
 		got, readErr := os.ReadFile(dest) //nolint:gosec // test fixture reads a test-owned temporary path
 		require.NoError(t, readErr)
@@ -166,6 +171,125 @@ func TestClient_DownloadLeavesNothingBehindOnFailure(t *testing.T) {
 		require.NoError(t, readErr)
 		assert.Equal(t, "local", string(got))
 		assert.Equal(t, []string{"local.bin"}, dirEntries(t, dir))
+	})
+}
+
+// roundTripFunc adapts a function to http.RoundTripper.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// failingBody fails on the first read, calling onRead before it does so a test can change the
+// destination while the response is being consumed.
+type failingBody struct {
+	onRead func()
+	read   bool
+}
+
+func (b *failingBody) Read([]byte) (int, error) {
+	if !b.read {
+		b.read = true
+		b.onRead()
+	}
+
+	return 0, io.ErrUnexpectedEOF
+}
+
+func (b *failingBody) Close() error { return nil }
+
+func TestClient_DownloadFailureKeepsAnotherWritersFile(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "local.bin")
+
+	written := filepath.Join(dir, "another.bin")
+	require.NoError(t, os.WriteFile(written, []byte("another writer"), fs.ModeFile))
+
+	// A file that takes the destination while the response is being read belongs to whoever put it
+	// there.
+	body := &failingBody{onRead: func() {
+		assert.NoFileExists(t, dest, "the destination is claimed only once the download is complete")
+		require.NoError(t, os.Rename(written, dest))
+	}}
+
+	client, err := NewClient("http://127.0.0.1/", "", "", TimeoutLow, "")
+	require.NoError(t, err)
+
+	client.client, err = dav.NewClient(&http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body, ContentLength: -1, Request: r}, nil
+	})}, "http://127.0.0.1/")
+	require.NoError(t, err)
+
+	require.ErrorContains(t, client.Download("/local.bin", dest, false), "failed writing")
+
+	got, readErr := os.ReadFile(dest) //nolint:gosec // test fixture reads a test-owned temporary path
+	require.NoError(t, readErr, "failure cleanup must remove only the file this call created")
+	assert.Equal(t, "another writer", string(got))
+	assert.Equal(t, []string{"local.bin"}, dirEntries(t, dir), "no staging file may survive")
+}
+
+func TestPublishSink(t *testing.T) {
+	stage := func(t *testing.T) (sink, dest string) {
+		t.Helper()
+
+		dir := t.TempDir()
+		sink = filepath.Join(dir, "staged.tmp")
+		require.NoError(t, os.WriteFile(sink, []byte("remote"), fs.ModeFile))
+
+		return sink, filepath.Join(dir, "local.bin")
+	}
+
+	t.Run("Success", func(t *testing.T) {
+		sink, dest := stage(t)
+		require.NoError(t, publishSink(sink, dest, false))
+
+		got, err := os.ReadFile(dest) //nolint:gosec // test fixture reads a test-owned temporary path
+		require.NoError(t, err)
+		assert.Equal(t, "remote", string(got))
+		assert.Equal(t, []string{"local.bin"}, dirEntries(t, filepath.Dir(dest)), "the staging file is gone")
+	})
+	t.Run("TakenName", func(t *testing.T) {
+		sink, dest := stage(t)
+		require.NoError(t, os.WriteFile(dest, []byte("local"), fs.ModeFile))
+		assert.ErrorIs(t, publishSink(sink, dest, false), os.ErrExist)
+
+		got, err := os.ReadFile(dest) //nolint:gosec // test fixture reads a test-owned temporary path
+		require.NoError(t, err)
+		assert.Equal(t, "local", string(got), "a taken name keeps its file")
+	})
+	t.Run("TakenNameWithForce", func(t *testing.T) {
+		sink, dest := stage(t)
+		require.NoError(t, os.WriteFile(dest, []byte("local"), fs.ModeFile))
+		require.NoError(t, publishSink(sink, dest, true))
+
+		got, err := os.ReadFile(dest) //nolint:gosec // test fixture reads a test-owned temporary path
+		require.NoError(t, err)
+		assert.Equal(t, "remote", string(got))
+	})
+	t.Run("MissingSink", func(t *testing.T) {
+		_, dest := stage(t)
+		assert.Error(t, publishSink(filepath.Join(filepath.Dir(dest), "absent.tmp"), dest, false))
+		assert.NoFileExists(t, dest)
+	})
+	t.Run("WithoutHardLinks", func(t *testing.T) {
+		// The path a filesystem without hard links takes, with the same two outcomes.
+		unsupported := func(string, string) error { return &os.LinkError{Op: "link", Err: syscall.EPERM} }
+		orig := linkFile
+		linkFile = unsupported
+		t.Cleanup(func() { linkFile = orig })
+
+		sink, dest := stage(t)
+		require.NoError(t, publishSink(sink, dest, false))
+		got, err := os.ReadFile(dest) //nolint:gosec // test fixture reads a test-owned temporary path
+		require.NoError(t, err)
+		assert.Equal(t, "remote", string(got), "the staged bytes are published, not an empty file")
+		assert.Equal(t, []string{"local.bin"}, dirEntries(t, filepath.Dir(dest)))
+
+		taken, occupied := stage(t)
+		require.NoError(t, os.WriteFile(occupied, []byte("local"), fs.ModeFile))
+		assert.ErrorIs(t, publishSink(taken, occupied, false), os.ErrExist)
+		kept, err := os.ReadFile(occupied) //nolint:gosec // test fixture reads a test-owned temporary path
+		require.NoError(t, err)
+		assert.Equal(t, "local", string(kept), "a taken name keeps its file")
 	})
 }
 

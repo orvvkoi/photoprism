@@ -477,24 +477,14 @@ func (c *Client) Download(src, dest string, force bool) (err error) {
 		}
 	}()
 
-	// The file the bytes are written to is always one this call created: without force that is the
-	// destination itself, opened exclusively so an existing file is never replaced, and with force a
-	// temporary sibling that takes the destination's place once the download is complete.
-	sink := dest
-
-	if force {
-		sink = tempSink(dest)
-	}
+	// The bytes go to a temporary sibling this call creates exclusively, and only the publish step
+	// below touches the destination.
+	sink := tempSink(dest)
 
 	f, err := os.OpenFile(sink, os.O_WRONLY|os.O_CREATE|os.O_EXCL, fs.ModeFile) //nolint:gosec // dest provided by caller
 
 	if err != nil {
 		log.Errorf("webdav: %s", clean.Error(err))
-
-		if errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("webdav: %s already exists: %w", clean.Log(path.Base(dest)), os.ErrExist)
-		}
-
 		return fmt.Errorf("webdav: failed to create %s", clean.Log(path.Base(dest)))
 	}
 
@@ -512,10 +502,8 @@ func (c *Client) Download(src, dest string, force bool) (err error) {
 	}()
 
 	// Keep the mode a replaced destination already had, so it is not widened by the staging file.
-	if sink != dest {
-		if info, statErr := os.Stat(dest); statErr == nil {
-			_ = f.Chmod(info.Mode().Perm())
-		}
+	if info, statErr := os.Stat(dest); statErr == nil {
+		_ = f.Chmod(info.Mode().Perm())
 	}
 
 	if c.downloadLimit > 0 {
@@ -540,16 +528,50 @@ func (c *Client) Download(src, dest string, force bool) (err error) {
 		return fmt.Errorf("webdav: failed to finalize %s", clean.Log(path.Base(dest)))
 	}
 
-	if sink != dest {
-		if renameErr := os.Rename(sink, dest); renameErr != nil {
-			log.Errorf("webdav: %s", clean.Error(renameErr))
-			return fmt.Errorf("webdav: failed to finalize %s", clean.Log(path.Base(dest)))
+	if err = publishSink(sink, dest, force); err != nil {
+		log.Errorf("webdav: %s", clean.Error(err))
+
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("webdav: %s already exists: %w", clean.Log(path.Base(dest)), os.ErrExist)
 		}
+
+		return fmt.Errorf("webdav: failed to finalize %s", clean.Log(path.Base(dest)))
 	}
 
 	committed = true
 
 	return nil
+}
+
+// linkFile creates a hard link. A test replaces it to take the path of a filesystem that has none.
+var linkFile = os.Link
+
+// publishSink moves a staged download to its destination, and reports os.ErrExist when the name is
+// already taken and force is false.
+func publishSink(sink, dest string, force bool) error {
+	if force {
+		return os.Rename(sink, dest)
+	}
+
+	// The hard link is the check itself: it fails when the name is taken.
+	if err := linkFile(sink, dest); err == nil {
+		if rmErr := os.Remove(sink); rmErr != nil {
+			log.Debugf("webdav: %s (remove staging file)", clean.Error(rmErr))
+		}
+
+		return nil
+	} else if errors.Is(err, os.ErrExist) {
+		return err
+	}
+
+	// A filesystem that has no hard links is checked with a stat instead.
+	if _, err := os.Lstat(dest); err == nil {
+		return os.ErrExist
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	return os.Rename(sink, dest)
 }
 
 // DownloadDir downloads all files from a remote to a local directory.
