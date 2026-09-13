@@ -37,6 +37,11 @@ func InvalidPreviewToken(c *gin.Context) bool {
 // call InvalidDownloadToken and DownloadSession separately.
 func AuthDownload(c *gin.Context, resources acl.Resources) (sess *entity.Session, valid bool) {
 	if sess = DownloadSession(c); sess != nil {
+		if downloadNotAdmitted(c, sess) {
+			event.AuditWarn([]string{ClientIP(c), "session %s", "download %s", status.Denied}, sess.RefID, resources.String())
+			return nil, false
+		}
+
 		if downloadOutOfScope(c, sess, resources) {
 			event.AuditErr([]string{ClientIP(c), "session %s", "download %s with scope %s", status.Error(authn.ErrInsufficientScope)},
 				sess.RefID, resources.String(), clean.Scope(sess.AuthScope))
@@ -73,6 +78,29 @@ func downloadOutOfScope(c *gin.Context, sess *entity.Session, resources acl.Reso
 	}
 
 	return true
+}
+
+// downloadNotAdmitted reports whether the credential or the account behind the session is currently
+// ineligible, applying the checks AuthAny performs. A session carrying no account of its own is
+// admitted unless it is an app password; public mode and a header-authorized session are exempt.
+func downloadNotAdmitted(c *gin.Context, sess *entity.Session) bool {
+	if get.Config().Public() || headerAuthorizedDownload(c) {
+		return false
+	}
+
+	// An app password depends on the feature flag and on its account's Web UI/API access.
+	if sess.IsApplication() && (get.Config().DisableAppPasswords() || sess.GetUser().DenyLogIn()) {
+		return true
+	}
+
+	if sess.NoUser() {
+		return false
+	}
+
+	u := sess.GetUser()
+
+	// A client session additionally requires a regular account, as AuthAny requires of its owner.
+	return u.IsUnknown() || u.IsDisabled() || sess.IsClient() && !u.IsRegistered()
 }
 
 // InvalidDownloadToken checks if the request is not authorized to download any of the resources. It is a

@@ -7,11 +7,13 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/photoprism/photoprism/internal/auth/acl"
 	"github.com/photoprism/photoprism/internal/auth/tokens"
 	"github.com/photoprism/photoprism/internal/config"
 	"github.com/photoprism/photoprism/internal/entity"
+	"github.com/photoprism/photoprism/internal/entity/query"
 	"github.com/photoprism/photoprism/internal/photoprism/get"
 	"github.com/photoprism/photoprism/pkg/authn"
 )
@@ -73,6 +75,33 @@ func TestAuthDownloadScope(t *testing.T) {
 			assert.Equal(t, http.StatusNotFound, r.Code)
 		})
 	}
+}
+
+func TestAuthDownloadScopeServesTheSameOriginal(t *testing.T) {
+	// One account and one original, so the only difference between the two requests below is the
+	// scope: the refusal cannot be a missing file or a role the account does not hold.
+	app, router, conf := NewApiTest()
+	options := *conf.Options()
+	t.Cleanup(func() { *conf.Options() = options; conf.Propagate() })
+	conf.SetAuthMode(config.AuthModePasswd)
+	t.Cleanup(func() { conf.SetAuthMode(config.AuthModePublic) })
+	conf.Options().OriginalsPath = t.TempDir()
+	conf.Propagate()
+	GetPhotoDownload(router)
+
+	const uid = "ps6sg6be2lvl0y13"
+	file, err := query.FileByPhotoUID(uid)
+	require.NoError(t, err)
+	original := CreateTestOriginal(t, file)
+
+	wildcard := entity.SessionFixtures.Get("alice_app_password_full_access")
+	granted := PerformRequest(app, http.MethodGet, "/api/v1/photos/"+uid+"/dl?t="+tokens.SignDownload(wildcard.ID))
+	require.Equal(t, http.StatusOK, granted.Code)
+	assert.Equal(t, original, granted.Body.Bytes())
+
+	refused := entity.SessionFixtures.Get("alice_app_password_shares")
+	denied := PerformRequest(app, http.MethodGet, "/api/v1/photos/"+uid+"/dl?t="+tokens.SignDownload(refused.ID))
+	assert.Equal(t, http.StatusForbidden, denied.Code)
 }
 
 func TestAuthDownloadScopeUnchangedBranches(t *testing.T) {
