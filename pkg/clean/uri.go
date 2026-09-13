@@ -85,7 +85,13 @@ func UriRedacted(s string) string {
 		return ""
 	}
 
-	if q := uri.Query(); len(q) > 0 {
+	q, err := url.ParseQuery(uri.RawQuery)
+
+	// Only a query that parses can be examined parameter by parameter, so one that does not is
+	// masked as a whole.
+	if err != nil {
+		uri.RawQuery = UriRedactedValue
+	} else if len(q) > 0 {
 		redacted := false
 
 		for name, values := range q {

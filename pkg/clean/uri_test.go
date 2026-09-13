@@ -94,6 +94,22 @@ func TestUriRedactedQuery(t *testing.T) {
 		assert.Contains(t, result, "a=2")
 		assert.NotContains(t, result, "notreal")
 	})
+	t.Run("MalformedQuery", func(t *testing.T) {
+		for _, s := range []string{
+			"https://api.example.com/v1?token=notreal;tail",
+			"https://api.example.com/v1?token=notreal%zz",
+			"https://api.example.com/v1?other=ok&token=notreal;tail",
+			"https://api.example.com/v1?notreal;tail",
+		} {
+			result := UriRedacted(s)
+			assert.NotContainsf(t, result, "notreal", "%s must not keep its query", s)
+			assert.Containsf(t, result, "https://api.example.com/v1?***", "%s must report the removal", s)
+		}
+	})
+	t.Run("MalformedQueryKeepsUserinfoRedaction", func(t *testing.T) {
+		result := UriRedacted("https://user:pass@api.example.com/v1?token=notreal;tail")
+		assert.Equal(t, "https://user:***@api.example.com/v1?***", result)
+	})
 	t.Run("UserinfoAndQuery", func(t *testing.T) {
 		// A value that reads as redacted must not sit beside one that is not.
 		result := UriRedacted("https://user:pass@api.example.com/v1?access_token=notreal")

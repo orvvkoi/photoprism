@@ -299,20 +299,15 @@ func captureLog(t *testing.T) *test.Hook {
 	return hook
 }
 
-func TestNewClientLogsEndpointWithoutCredentials(t *testing.T) {
-	// Deliberately made of characters the sanitizers pass through unchanged, so the absence of the
-	// password below means it was redacted rather than merely escaped out of recognition.
-	const password = "sup3rs3cr3t-w3bdav-p4ss"
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	t.Cleanup(server.Close)
+// connectLog returns everything NewClient logged while connecting to the given endpoint.
+func connectLog(t *testing.T, serverUrl, user, pass string) string {
+	t.Helper()
 
 	hook := captureLog(t)
 
-	_, err := NewClient(server.URL+"/", "webdav-user", password, TimeoutLow, "")
-	require.NoError(t, err)
+	if _, err := NewClient(serverUrl, user, pass, TimeoutLow, ""); err != nil {
+		t.Fatal(err)
+	}
 
 	var logged strings.Builder
 
@@ -321,7 +316,36 @@ func TestNewClientLogsEndpointWithoutCredentials(t *testing.T) {
 		logged.WriteString("\n")
 	}
 
-	assert.NotContains(t, logged.String(), password, "the configured password must not reach the log")
-	assert.Contains(t, logged.String(), clean.UriRedactedValue, "the credential is marked as removed")
-	assert.Contains(t, logged.String(), "webdav-user", "the account name identifies the connection")
+	return logged.String()
+}
+
+func TestNewClientLogsEndpointWithoutCredentials(t *testing.T) {
+	// Deliberately made of characters the sanitizers pass through unchanged, so the absence of the
+	// secrets below means they were redacted rather than merely escaped out of recognition.
+	const password = "sup3rs3cr3t-w3bdav-p4ss"
+	const token = "sup3rs3cr3t-w3bdav-t0k3n"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	t.Run("Userinfo", func(t *testing.T) {
+		logged := connectLog(t, server.URL+"/", "webdav-user", password)
+		assert.NotContains(t, logged, password, "the configured password must not reach the log")
+		assert.Contains(t, logged, clean.UriRedactedValue, "the credential is marked as removed")
+		assert.Contains(t, logged, "webdav-user", "the account name identifies the connection")
+	})
+	t.Run("QueryCredential", func(t *testing.T) {
+		logged := connectLog(t, server.URL+"/?token="+token, "webdav-user", password)
+		assert.NotContains(t, logged, token, "a credential parameter must not reach the log")
+		assert.NotContains(t, logged, password, "the configured password must not reach the log")
+	})
+	t.Run("MalformedQueryCredential", func(t *testing.T) {
+		for _, query := range []string{"?token=" + token + ";tail", "?token=" + token + "%zz", "?other=ok&token=" + token + ";tail"} {
+			logged := connectLog(t, server.URL+"/"+query, "webdav-user", password)
+			assert.NotContainsf(t, logged, token, "%s must not reach the log", query)
+			assert.NotContains(t, logged, password, "the configured password must not reach the log")
+		}
+	})
 }

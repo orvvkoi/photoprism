@@ -254,7 +254,8 @@ func (c *Config) RemoveRedactedOptionValues(values Values) (removed []string) {
 }
 
 // isRedactedOptionValue reports whether a value is one this package renders rather than stores:
-// the marker, or a URL whose password is the one url.URL.Redacted substitutes.
+// the marker, a URL whose query was rendered with it, or a URL whose password is the one
+// url.URL.Redacted substitutes.
 func isRedactedOptionValue(s string) bool {
 	if s == "" {
 		return false
@@ -264,7 +265,15 @@ func isRedactedOptionValue(s string) bool {
 
 	u, err := url.Parse(s)
 
-	if err != nil || u.User == nil {
+	if err != nil {
+		return false
+	}
+
+	if strings.Contains(u.RawQuery, clean.UriRedactedValue) {
+		return true
+	}
+
+	if u.User == nil {
 		return false
 	}
 

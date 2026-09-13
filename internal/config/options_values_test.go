@@ -388,6 +388,14 @@ func TestIsRedactedOptionValue(t *testing.T) {
 	t.Run("NoCredentials", func(t *testing.T) {
 		assert.False(t, isRedactedOptionValue("https://proxy.example.com:3128"))
 	})
+	t.Run("RenderedQuery", func(t *testing.T) {
+		// A credential can sit in the query, which is rendered as the marker when it does not parse.
+		assert.True(t, isRedactedOptionValue("https://proxy.example.com:3128/?token=***"))
+		assert.True(t, isRedactedOptionValue("https://proxy.example.com:3128/?***"))
+	})
+	t.Run("RealQuery", func(t *testing.T) {
+		assert.False(t, isRedactedOptionValue("https://proxy.example.com:3128/?tier=fast"))
+	})
 	t.Run("Empty", func(t *testing.T) {
 		assert.False(t, isRedactedOptionValue(""))
 	})
